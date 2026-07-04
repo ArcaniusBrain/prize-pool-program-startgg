@@ -72,6 +72,40 @@ pub mod prize_pool_program {
 
         Ok(())
     }
+
+    /// Reembolsa a un jugador. SOLO el admin del torneo puede ejecutarla
+    /// (el jugador no puede autogestionarse el reembolso, por diseño).
+    /// Devuelve el entry_fee desde la bóveda a la wallet del jugador y cierra
+    /// su PlayerRecord (close = player_wallet le devuelve además la renta).
+    pub fn refund_player(ctx: Context<RefundPlayer>) -> Result<()> {
+        let amount = ctx.accounts.player_record.amount_paid;
+        let tournament_key = ctx.accounts.tournament.key();
+        let vault_bump = ctx.accounts.tournament.vault_bump;
+
+        // La bóveda es una PDA: el programa firma la transferencia con sus seeds.
+        let signer_seeds: &[&[&[u8]]] =
+            &[&[b"vault", tournament_key.as_ref(), &[vault_bump]]];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.key(),
+                Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.player_wallet.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
+
+        let tournament = &mut ctx.accounts.tournament;
+        tournament.total_funds = tournament
+            .total_funds
+            .checked_sub(amount)
+            .ok_or(PrizePoolError::MathOverflow)?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +171,38 @@ pub struct RegisterPlayer<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct RefundPlayer<'info> {
+    /// has_one = admin: la firma DEBE ser la wallet guardada como admin del torneo.
+    #[account(mut, has_one = admin @ PrizePoolError::Unauthorized)]
+    pub tournament: Account<'info, TournamentAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", tournament.key().as_ref()],
+        bump = tournament.vault_bump
+    )]
+    pub vault: SystemAccount<'info>,
+
+    /// Se cierra al reembolsar: la renta vuelve al jugador junto con su entry_fee.
+    /// has_one valida que el record pertenece a este torneo y a esta wallet.
+    #[account(
+        mut,
+        close = player_wallet,
+        has_one = tournament,
+        has_one = player_wallet
+    )]
+    pub player_record: Account<'info, PlayerRecord>,
+
+    /// Wallet del jugador que recibe el reembolso. No firma: el admin ejecuta.
+    #[account(mut)]
+    pub player_wallet: SystemAccount<'info>,
+
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // ---------------------------------------------------------------------------
 // Cuentas (estado on-chain) — según el diseño cerrado del proyecto
 // ---------------------------------------------------------------------------
@@ -173,4 +239,6 @@ pub enum PrizePoolError {
     InvalidEntryFee,
     #[msg("Overflow aritmético al acumular fondos.")]
     MathOverflow,
+    #[msg("Solo el admin del torneo puede ejecutar esta acción.")]
+    Unauthorized,
 }

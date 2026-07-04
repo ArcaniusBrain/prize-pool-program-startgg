@@ -74,6 +74,27 @@ fn register_ix(tournament: &Pubkey, player_wallet: &Pubkey, entrant_id: u32) -> 
     )
 }
 
+fn refund_ix(
+    tournament: &Pubkey,
+    player_wallet: &Pubkey,
+    entrant_id: u32,
+    admin: &Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        prize_pool_program::id(),
+        &prize_pool_program::instruction::RefundPlayer {}.data(),
+        prize_pool_program::accounts::RefundPlayer {
+            tournament: *tournament,
+            vault: vault_pda(tournament),
+            player_record: player_record_pda(tournament, entrant_id),
+            player_wallet: *player_wallet,
+            admin: *admin,
+            system_program: anchor_lang::system_program::ID,
+        }
+        .to_account_metas(None),
+    )
+}
+
 fn read_tournament(svm: &LiteSVM, pda: &Pubkey) -> prize_pool_program::TournamentAccount {
     let acct = svm.get_account(pda).expect("TournamentAccount no existe");
     prize_pool_program::TournamentAccount::try_deserialize(&mut acct.data.as_slice()).unwrap()
@@ -228,4 +249,104 @@ fn test_rechaza_doble_inscripcion_del_mismo_entrant() {
     // El estado no cambió: sigue habiendo un solo pago acumulado
     let t = read_tournament(&svm, &tournament);
     assert_eq!(t.total_funds, ENTRY_FEE);
+}
+
+#[test]
+fn test_refund_devuelve_fondos_y_cierra_el_record() {
+    let (mut svm, admin, tournament, vault) = setup();
+    let player1 = new_player(&mut svm);
+
+    send_ix(
+        &mut svm,
+        register_ix(&tournament, &player1.pubkey(), ENTRANT_1),
+        &player1,
+    )
+    .expect("registro falló");
+
+    let record = player_record_pda(&tournament, ENTRANT_1);
+    let record_rent = svm.get_account(&record).unwrap().lamports;
+    let player_antes = svm.get_account(&player1.pubkey()).unwrap().lamports;
+    let vault_antes = vault_balance(&svm, &vault);
+
+    // El ADMIN ejecuta el reembolso (el jugador no firma nada)
+    send_ix(
+        &mut svm,
+        refund_ix(&tournament, &player1.pubkey(), ENTRANT_1, &admin.pubkey()),
+        &admin,
+    )
+    .expect("refund_player falló");
+
+    // El jugador recupera su entry_fee + la renta del PlayerRecord cerrado
+    let player_despues = svm.get_account(&player1.pubkey()).unwrap().lamports;
+    assert_eq!(player_despues - player_antes, ENTRY_FEE + record_rent);
+
+    // La bóveda devolvió exactamente el entry_fee
+    assert_eq!(vault_antes - vault_balance(&svm, &vault), ENTRY_FEE);
+
+    // El acumulado volvió a cero y el record quedó cerrado
+    let t = read_tournament(&svm, &tournament);
+    assert_eq!(t.total_funds, 0);
+    assert!(svm
+        .get_account(&record)
+        .map_or(true, |a| a.lamports == 0));
+}
+
+#[test]
+fn test_refund_rechaza_a_quien_no_es_admin() {
+    let (mut svm, _admin, tournament, _vault) = setup();
+    let player1 = new_player(&mut svm);
+
+    send_ix(
+        &mut svm,
+        register_ix(&tournament, &player1.pubkey(), ENTRANT_1),
+        &player1,
+    )
+    .expect("registro falló");
+
+    // El propio jugador intenta autogestionarse el reembolso: debe fallar
+    // por la restricción has_one = admin del torneo.
+    let res = send_ix(
+        &mut svm,
+        refund_ix(&tournament, &player1.pubkey(), ENTRANT_1, &player1.pubkey()),
+        &player1,
+    );
+    assert!(res.is_err(), "el reembolso por un no-admin debió fallar");
+
+    // Nada cambió: el pago sigue en la bóveda
+    let t = read_tournament(&svm, &tournament);
+    assert_eq!(t.total_funds, ENTRY_FEE);
+}
+
+#[test]
+fn test_refund_no_puede_ejecutarse_dos_veces() {
+    let (mut svm, admin, tournament, _vault) = setup();
+    let player1 = new_player(&mut svm);
+
+    send_ix(
+        &mut svm,
+        register_ix(&tournament, &player1.pubkey(), ENTRANT_1),
+        &player1,
+    )
+    .expect("registro falló");
+
+    // Primer reembolso: pasa
+    send_ix(
+        &mut svm,
+        refund_ix(&tournament, &player1.pubkey(), ENTRANT_1, &admin.pubkey()),
+        &admin,
+    )
+    .expect("el primer reembolso falló");
+
+    // Avanzamos el blockhash para que la segunda tx no sea idéntica a la
+    // primera (litesvm la rechazaría por duplicada antes de ejecutarla).
+    svm.expire_blockhash();
+
+    // Segundo reembolso del mismo record: debe fallar porque el
+    // PlayerRecord ya fue cerrado y no existe.
+    let res = send_ix(
+        &mut svm,
+        refund_ix(&tournament, &player1.pubkey(), ENTRANT_1, &admin.pubkey()),
+        &admin,
+    );
+    assert!(res.is_err(), "el segundo reembolso debió fallar");
 }
