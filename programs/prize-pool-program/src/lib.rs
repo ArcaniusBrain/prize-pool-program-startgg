@@ -14,8 +14,20 @@ pub mod prize_pool_program {
         ctx: Context<InitializeTournament>,
         startgg_bracket_id: u32,
         entry_fee: u64,
+        prize_percentages: Vec<u8>,
     ) -> Result<()> {
         require!(entry_fee > 0, PrizePoolError::InvalidEntryFee);
+
+        // El reparto lo define el TO al habilitar el prize pool (ej. 60/30/10):
+        // entre 1 y 10 posiciones, y los porcentajes deben sumar exactamente 100.
+        // Queda grabado on-chain ANTES de que nadie pague: el admin no puede
+        // cambiarlo después de recaudar.
+        require!(
+            !prize_percentages.is_empty() && prize_percentages.len() <= 10,
+            PrizePoolError::InvalidPercentages
+        );
+        let suma: u32 = prize_percentages.iter().map(|p| *p as u32).sum();
+        require!(suma == 100, PrizePoolError::InvalidPercentages);
 
         let tournament = &mut ctx.accounts.tournament;
         tournament.admin = ctx.accounts.admin.key();
@@ -24,6 +36,7 @@ pub mod prize_pool_program {
         tournament.total_funds = 0;
         tournament.is_open = true;
         tournament.vault_bump = ctx.bumps.vault;
+        tournament.prize_percentages = prize_percentages;
 
         Ok(())
     }
@@ -103,6 +116,95 @@ pub mod prize_pool_program {
             .total_funds
             .checked_sub(amount)
             .ok_or(PrizePoolError::MathOverflow)?;
+
+        Ok(())
+    }
+
+    /// Reparte el pozo entre los ganadores según los porcentajes definidos al
+    /// crear el torneo, y lo cierra (is_open = false). SOLO el admin puede
+    /// ejecutarla. Los ganadores se pasan en orden (1°, 2°, 3°...) como
+    /// remaining_accounts en pares [PlayerRecord, wallet], y sus entrant_ids
+    /// (obtenidos de standings de Start.gg) como argumento.
+    pub fn distribute_prizes<'info>(
+        ctx: Context<'info, DistributePrizes<'info>>,
+        winner_entrant_ids: Vec<u32>,
+    ) -> Result<()> {
+        let tournament = &ctx.accounts.tournament;
+        require!(tournament.is_open, PrizePoolError::TournamentClosed);
+        require!(
+            winner_entrant_ids.len() == tournament.prize_percentages.len(),
+            PrizePoolError::WrongWinnerCount
+        );
+        require!(
+            ctx.remaining_accounts.len() == winner_entrant_ids.len() * 2,
+            PrizePoolError::WrongWinnerCount
+        );
+
+        let pot = tournament.total_funds;
+        let tournament_key = tournament.key();
+        let vault_bump = tournament.vault_bump;
+        let percentages = tournament.prize_percentages.clone();
+
+        let signer_seeds: &[&[&[u8]]] =
+            &[&[b"vault", tournament_key.as_ref(), &[vault_bump]]];
+
+        let mut distributed: u64 = 0;
+
+        for (i, entrant_id) in winner_entrant_ids.iter().enumerate() {
+            let record_info = &ctx.remaining_accounts[i * 2];
+            let wallet_info = &ctx.remaining_accounts[i * 2 + 1];
+
+            // 1) El PlayerRecord debe ser la PDA exacta de este entrant en este
+            //    torneo => el "ganador" realmente pagó su inscripción aquí.
+            let (expected_record, _) = Pubkey::find_program_address(
+                &[
+                    b"player_record",
+                    tournament_key.as_ref(),
+                    &entrant_id.to_le_bytes(),
+                ],
+                ctx.program_id,
+            );
+            require_keys_eq!(
+                record_info.key(),
+                expected_record,
+                PrizePoolError::WinnerAccountMismatch
+            );
+
+            // 2) La wallet destino debe ser la misma que pagó la inscripción.
+            let record: Account<PlayerRecord> = Account::try_from(record_info)?;
+            require_keys_eq!(
+                record.player_wallet,
+                wallet_info.key(),
+                PrizePoolError::WinnerAccountMismatch
+            );
+
+            // 3) Premio = pozo * porcentaje / 100 (u128 evita overflow; el polvo
+            //    por redondeo entero queda en la bóveda).
+            let amount = ((pot as u128) * (percentages[i] as u128) / 100) as u64;
+
+            transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.key(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: wallet_info.clone(),
+                    },
+                    signer_seeds,
+                ),
+                amount,
+            )?;
+
+            distributed = distributed
+                .checked_add(amount)
+                .ok_or(PrizePoolError::MathOverflow)?;
+        }
+
+        let tournament = &mut ctx.accounts.tournament;
+        tournament.total_funds = tournament
+            .total_funds
+            .checked_sub(distributed)
+            .ok_or(PrizePoolError::MathOverflow)?;
+        tournament.is_open = false;
 
         Ok(())
     }
@@ -203,6 +305,24 @@ pub struct RefundPlayer<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Los ganadores van como remaining_accounts: [record_1°, wallet_1°, record_2°, wallet_2°, ...]
+#[derive(Accounts)]
+pub struct DistributePrizes<'info> {
+    #[account(mut, has_one = admin @ PrizePoolError::Unauthorized)]
+    pub tournament: Account<'info, TournamentAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", tournament.key().as_ref()],
+        bump = tournament.vault_bump
+    )]
+    pub vault: SystemAccount<'info>,
+
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // ---------------------------------------------------------------------------
 // Cuentas (estado on-chain) — según el diseño cerrado del proyecto
 // ---------------------------------------------------------------------------
@@ -216,6 +336,8 @@ pub struct TournamentAccount {
     pub total_funds: u64,        // Fondos acumulados en la bóveda
     pub is_open: bool,           // Estado del registro
     pub vault_bump: u8,
+    #[max_len(10)]
+    pub prize_percentages: Vec<u8>, // Reparto por posición (1°, 2°...). Suma 100.
 }
 
 #[account]
@@ -241,4 +363,12 @@ pub enum PrizePoolError {
     MathOverflow,
     #[msg("Solo el admin del torneo puede ejecutar esta acción.")]
     Unauthorized,
+    #[msg("Los porcentajes de premio deben ser de 1 a 10 posiciones y sumar exactamente 100.")]
+    InvalidPercentages,
+    #[msg("El torneo ya fue cerrado; los premios ya se repartieron.")]
+    TournamentClosed,
+    #[msg("La cantidad de ganadores no coincide con los porcentajes definidos.")]
+    WrongWinnerCount,
+    #[msg("Un ganador no coincide: el PlayerRecord o la wallet no corresponden a ese entrant.")]
+    WinnerAccountMismatch,
 }
